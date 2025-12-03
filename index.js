@@ -539,14 +539,12 @@
 //   console.log(`Stock issuance with packaging layers — ALL ENDPOINTS ACTIVE`);
 // });
 
-
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const admin = require('firebase-admin');
+
 const serviceAccount = require('./serviceAccountKey.json');
-const { parseSupplierItem } = require('./utils/universalSupplierParser');
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -555,6 +553,7 @@ admin.initializeApp({
 const db = admin.firestore();
 const app = express();
 
+// Middleware
 app.use(cors({ origin: '*' }));
 app.use(morgan('dev'));
 app.use(express.json());
@@ -572,7 +571,7 @@ const serializeTimestamp = (timestamp) => {
 const serializeDoc = (doc) => {
   const data = doc.data();
   const serialized = { id: doc.id };
-  
+
   for (const [key, value] of Object.entries(data)) {
     if (value && typeof value === 'object' && value.toDate) {
       serialized[key] = serializeTimestamp(value);
@@ -591,20 +590,219 @@ const serializeDoc = (doc) => {
       serialized[key] = value;
     }
   }
-  
+
   return serialized;
 };
 
-// GET suppliers
+// ========== HEALTH CHECK ==========
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ========== USER AUTHENTICATION & MANAGEMENT ==========
+
+// Register new sales team member
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, username } = req.body;
+
+    if (!email || !password || !username) {
+      return res.status(400).json({ error: 'Email, password, and username are required' });
+    }
+
+    // Check if user already exists
+    const existingUser = await db.collection('users')
+      .where('email', '==', email.toLowerCase())
+      .get();
+
+    if (!existingUser.empty) {
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+
+    // Create user with Firebase Auth
+    const userRecord = await admin.auth().createUser({
+      email: email.toLowerCase(),
+      password: password,
+      displayName: username
+    });
+
+    // Store user data in Firestore
+    const userData = {
+      uid: userRecord.uid,
+      email: email.toLowerCase(),
+      username: username,
+      isVerified: false,
+      assignedVehicleId: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    await db.collection('users').doc(userRecord.uid).set(userData);
+
+    res.status(201).json({
+      success: true,
+      message: 'Registration successful. Please wait for admin verification.',
+      user: {
+        uid: userRecord.uid,
+        email: userData.email,
+        username: userData.username,
+        isVerified: false
+      }
+    });
+  } catch (err) {
+    console.error('Registration error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Verify user exists in Firebase Auth
+    let userRecord;
+    try {
+      userRecord = await admin.auth().getUserByEmail(email.toLowerCase());
+    } catch (err) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // Get user data from Firestore
+    const userDoc = await db.collection('users').doc(userRecord.uid).get();
+
+    if (!userDoc.exists) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+
+    // Create custom token for the user
+    const customToken = await admin.auth().createCustomToken(userRecord.uid);
+
+    res.json({
+      success: true,
+      token: customToken,
+      user: {
+        uid: userRecord.uid,
+        email: userData.email,
+        username: userData.username,
+        isVerified: userData.isVerified,
+        assignedVehicleId: userData.assignedVehicleId
+      }
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get all users (sales team members)
+app.get('/api/users', async (req, res) => {
+  try {
+    console.log('Fetching users from Firestore...');
+    const snapshot = await db.collection('users').orderBy('createdAt', 'desc').get();
+    console.log(`Found ${snapshot.docs.length} users`);
+    
+    const users = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        uid: data.uid,
+        email: data.email,
+        username: data.username,
+        isVerified: data.isVerified,
+        assignedVehicleId: data.assignedVehicleId,
+        createdAt: serializeTimestamp(data.createdAt),
+        updatedAt: serializeTimestamp(data.updatedAt)
+      };
+    });
+    
+    res.json(users);
+  } catch (err) {
+    console.error('Error fetching users:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Toggle user verification status
+app.patch('/api/users/:id/verify', async (req, res) => {
+  try {
+    const { isVerified } = req.body;
+
+    if (typeof isVerified !== 'boolean') {
+      return res.status(400).json({ error: 'isVerified must be a boolean' });
+    }
+
+    await db.collection('users').doc(req.params.id).update({
+      isVerified: isVerified,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, message: `User ${isVerified ? 'verified' : 'unverified'} successfully` });
+  } catch (err) {
+    console.error('Error updating verification:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Assign vehicle to user
+app.patch('/api/users/:id/assign-vehicle', async (req, res) => {
+  try {
+    const { vehicleId } = req.body;
+
+    // If vehicleId is null, we're unassigning
+    if (vehicleId !== null) {
+      // Check if vehicle exists
+      const vehicleDoc = await db.collection('vehicles').doc(vehicleId).get();
+      if (!vehicleDoc.exists) {
+        return res.status(404).json({ error: 'Vehicle not found' });
+      }
+
+      // Check if vehicle is already assigned to another user
+      const assignedUser = await db.collection('users')
+        .where('assignedVehicleId', '==', vehicleId)
+        .get();
+
+      if (!assignedUser.empty && assignedUser.docs[0].id !== req.params.id) {
+        return res.status(400).json({ error: 'Vehicle is already assigned to another user' });
+      }
+    }
+
+    await db.collection('users').doc(req.params.id).update({
+      assignedVehicleId: vehicleId,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true,
+      message: vehicleId ? 'Vehicle assigned successfully' : 'Vehicle unassigned successfully'
+    });
+  } catch (err) {
+    console.error('Error assigning vehicle:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== SUPPLIERS ==========
+
+// PUBLIC: Supplier list
 app.get('/api/suppliers', async (req, res) => {
   try {
     const snapshot = await db.collection('suppliers').where('isActive', '==', true).get();
     const suppliers = snapshot.docs.map(doc => serializeDoc(doc));
     res.json(suppliers);
   } catch (err) {
+    console.error('Error fetching suppliers:', err);
     res.status(500).json({ error: 'Suppliers not found' });
   }
 });
+
+// ========== INVENTORY ==========
 
 // GET inventory
 app.get('/api/inventory', async (req, res) => {
@@ -635,14 +833,14 @@ app.post('/api/inventory', async (req, res) => {
       .where('productNameLower', '==', req.body.productName.toLowerCase())
       .where('isActive', '==', true)
       .get();
-    
+
     if (!existingSnapshot.empty) {
       return res.status(400).json({
         error: 'Duplicate product name',
         message: `Item "${req.body.productName}" already exists in inventory`
       });
     }
-    
+
     const data = {
       ...req.body,
       productNameLower: (req.body.productName || '').toLowerCase(),
@@ -656,7 +854,7 @@ app.post('/api/inventory', async (req, res) => {
       dateAdded: admin.firestore.FieldValue.serverTimestamp(),
       lastUpdated: admin.firestore.FieldValue.serverTimestamp()
     };
-    
+
     const ref = await db.collection('inventory').add(data);
     res.status(201).json({ id: ref.id, ...data });
   } catch (err) {
@@ -678,7 +876,7 @@ app.put('/api/inventory/:id', async (req, res) => {
       stockInSubUnits: req.body.stockInSubUnits || 0,
       lastUpdated: admin.firestore.FieldValue.serverTimestamp()
     };
-    
+
     await db.collection('inventory').doc(req.params.id).update(data);
     res.json({ success: true });
   } catch (err) {
@@ -691,86 +889,115 @@ app.post('/api/inventory/:id/break', async (req, res) => {
   try {
     const { quantity } = req.body;
     const qtyToBreak = parseInt(quantity) || 1;
-    
+
     if (qtyToBreak <= 0) return res.status(400).json({ error: 'Invalid quantity' });
-    
+
     await db.runTransaction(async (t) => {
       const docRef = db.collection('inventory').doc(req.params.id);
       const doc = await t.get(docRef);
-      
+
       if (!doc.exists) throw new Error('Item not found');
-      
+
       const data = doc.data();
       const packaging = data.packagingStructure;
-      
+
       // Case 1: Array-based structure
       if (packaging && Array.isArray(packaging) && packaging.length >= 2) {
         const masterIdx = 0;
         const subIdx = 1;
+
         const masterStock = packaging[masterIdx].stock || 0;
-        
         if (masterStock < qtyToBreak) {
           throw new Error('Insufficient master units to break');
         }
-        
+
         let conversion = data.subUnitsPerSupplierUnit;
         if (!conversion && packaging[subIdx].qty) {
           conversion = packaging[subIdx].qty;
         }
-        
+
         if (!conversion || conversion <= 0) {
           throw new Error('Invalid conversion rate defined for item');
         }
-        
+
         const subUnitsToAdd = qtyToBreak * conversion;
-        
+
         packaging[masterIdx].stock = masterStock - qtyToBreak;
         packaging[subIdx].stock = (packaging[subIdx].stock || 0) + subUnitsToAdd;
-        
+
         t.update(docRef, {
           packagingStructure: packaging,
           lastUpdated: admin.firestore.FieldValue.serverTimestamp()
         });
-        
         return;
       }
-      
+
       // Case 2: Flat structure (Legacy)
       if (data.hasSubUnits && data.subUnitsPerSupplierUnit > 0) {
         const masterStock = data.stockInSupplierUnits || 0;
-        
         if (masterStock < qtyToBreak) {
           throw new Error('Insufficient master units to break');
         }
-        
+
         const subUnitsToAdd = qtyToBreak * data.subUnitsPerSupplierUnit;
-        
+
         t.update(docRef, {
           stockInSupplierUnits: masterStock - qtyToBreak,
           stockInSubUnits: (data.stockInSubUnits || 0) + subUnitsToAdd,
           lastUpdated: admin.firestore.FieldValue.serverTimestamp()
         });
-        
         return;
       }
-      
+
       throw new Error('Item does not support breaking units');
     });
-    
+
     res.json({ success: true, message: 'Unit broken successfully' });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
+// ========== VEHICLES ==========
+
+// GET all vehicles
+app.get('/api/vehicles', async (req, res) => {
+  try {
+    console.log('Fetching vehicles from Firestore...');
+    const snapshot = await db.collection('vehicles').where('isActive', '==', true).get();
+    console.log(`Found ${snapshot.docs.length} vehicles`);
+    
+    const vehicles = snapshot.docs.map(doc => serializeDoc(doc));
+    res.json(vehicles);
+  } catch (err) {
+    console.error('Error fetching vehicles:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET single vehicle
+app.get('/api/vehicles/:id', async (req, res) => {
+  try {
+    const doc = await db.collection('vehicles').doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Vehicle not found' });
+    res.json(serializeDoc(doc));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// CREATE vehicle
 app.post('/api/vehicles', async (req, res) => {
   try {
-    const { vehicleName, registrationNumber, salesTeamMember } = req.body;
-    
+    const { registrationNumber, vehicleName } = req.body;
+
+    if (!registrationNumber) {
+      return res.status(400).json({ error: 'Registration number is required' });
+    }
+
     const data = {
-      vehicleName,
       registrationNumber,
-      salesTeamMember,
+      vehicleName: vehicleName || '',
       isActive: true,
       dateCreated: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -782,30 +1009,22 @@ app.post('/api/vehicles', async (req, res) => {
   }
 });
 
-app.get('/api/vehicles/:id', async (req, res) => {
-  try {
-    const doc = await db.collection('vehicles').doc(req.params.id).get();
-    if (!doc.exists) return res.status(404).json({ error: 'Vehicle not found' });
-    res.json(serializeDoc(doc));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ========== STOCK ISSUANCE ==========
+
+// CREATE stock issuance
 app.post('/api/stock-issuance', async (req, res) => {
   try {
     const { vehicleId, items } = req.body;
-    
+
     if (!vehicleId || !items || items.length === 0) {
       return res.status(400).json({ error: 'vehicleId and items required' });
     }
-    
+
     const vehicleDoc = await db.collection('vehicles').doc(vehicleId).get();
     if (!vehicleDoc.exists) {
       return res.status(404).json({ error: 'Vehicle not found' });
     }
-    
+
     const issuanceRef = db.collection('stock-issuances').doc();
     const issuanceData = {
       vehicleId,
@@ -815,28 +1034,28 @@ app.post('/api/stock-issuance', async (req, res) => {
       collectedAt: null,
       notes: req.body.notes || '',
     };
-    
+
     for (const itemToIssue of items) {
       const { inventoryId, layers } = itemToIssue;
-      
+
       const inventoryDoc = await db.collection('inventory').doc(inventoryId).get();
       if (!inventoryDoc.exists) {
         return res.status(404).json({ error: `Inventory item ${inventoryId} not found` });
       }
-      
+
       const inventoryData = inventoryDoc.data();
       const packagingStructure = inventoryData.packagingStructure || [];
-      
+
       for (const layer of layers) {
         const { layerIndex, quantity } = layer;
         const packagingLayer = packagingStructure[layerIndex];
-        
+
         if (!packagingLayer) {
           return res.status(400).json({
             error: `Invalid layer index ${layerIndex} for ${inventoryData.productName}`
           });
         }
-        
+
         const currentStock = packagingLayer.stock || 0;
         if (currentStock < quantity) {
           return res.status(400).json({
@@ -846,7 +1065,7 @@ app.post('/api/stock-issuance', async (req, res) => {
           });
         }
       }
-      
+
       const updatedPackaging = [...packagingStructure];
       for (const layer of layers) {
         const { layerIndex, quantity } = layer;
@@ -855,12 +1074,12 @@ app.post('/api/stock-issuance', async (req, res) => {
           stock: (updatedPackaging[layerIndex].stock || 0) - quantity
         };
       }
-      
+
       await db.collection('inventory').doc(inventoryId).update({
         packagingStructure: updatedPackaging,
         lastUpdated: admin.firestore.FieldValue.serverTimestamp()
       });
-      
+
       issuanceData.items.push({
         inventoryId,
         productName: inventoryData.productName,
@@ -875,7 +1094,7 @@ app.post('/api/stock-issuance', async (req, res) => {
         buyingPrice: inventoryData.buyingPricePerUnit || 0,
       });
     }
-    
+
     await issuanceRef.set(issuanceData);
     const createdDoc = await issuanceRef.get();
     res.status(201).json(serializeDoc(createdDoc));
@@ -885,13 +1104,14 @@ app.post('/api/stock-issuance', async (req, res) => {
   }
 });
 
+// GET issuances for vehicle
 app.get('/api/vehicles/:vehicleId/issuances', async (req, res) => {
   try {
     const snapshot = await db.collection('stock-issuances')
       .where('vehicleId', '==', req.params.vehicleId)
       .orderBy('issuedAt', 'desc')
       .get();
-    
+
     const issuances = snapshot.docs.map(doc => serializeDoc(doc));
     res.json(issuances);
   } catch (err) {
@@ -900,39 +1120,42 @@ app.get('/api/vehicles/:vehicleId/issuances', async (req, res) => {
   }
 });
 
+// COLLECT item layer from issuance
 app.patch('/api/stock-issuance/:issuanceId/item/:itemIndex/layer/:layerIndex/collect', async (req, res) => {
   try {
     const { issuanceId, itemIndex, layerIndex } = req.params;
-    
     const issuanceDoc = await db.collection('stock-issuances').doc(issuanceId).get();
+
     if (!issuanceDoc.exists) {
       return res.status(404).json({ error: 'Issuance not found' });
     }
-    
+
     const issuanceData = issuanceDoc.data();
     const item = issuanceData.items[parseInt(itemIndex)];
-    
+
     if (!item) {
       return res.status(404).json({ error: 'Item not found in issuance' });
     }
-    
+
     const layer = item.layers[parseInt(layerIndex)];
     if (!layer) {
       return res.status(404).json({ error: 'Layer not found' });
     }
-    
+
     layer.collected = true;
     layer.collectedQty = layer.quantity;
     layer.collectedAt = new Date().toISOString();
-    
-    const allCollected = issuanceData.items.every(i => i.layers.every(l => l.collected));
-    
+
+    const allCollected = issuanceData.items.every(i =>
+      i.layers.every(l => l.collected)
+    );
+
     await db.collection('stock-issuances').doc(issuanceId).update({
       items: issuanceData.items,
       status: allCollected ? 'collected' : 'partial',
       collectedAt: allCollected ? admin.firestore.FieldValue.serverTimestamp() : null,
     });
-    
+
     res.json({ success: true, status: allCollected ? 'collected' : 'partial' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -940,23 +1163,24 @@ app.patch('/api/stock-issuance/:issuanceId/item/:itemIndex/layer/:layerIndex/col
 });
 
 // ========== REAL-TIME INVENTORY STREAM ==========
+
 let clients = [];
 
 const startRealtimeListener = () => {
   console.log("Starting real-time inventory listener...");
   const query = db.collection('inventory').where('isActive', '==', true);
-  
+
   const unsubscribe = query.onSnapshot((snapshot) => {
     const items = snapshot.docs.map(doc => serializeDoc(doc));
     console.log(`Pushing ${items.length} items to ${clients.length} clients`);
-    
+
     clients.forEach(client => {
       client.res.write(`data: ${JSON.stringify(items)}\n\n`);
     });
   }, (error) => {
     console.error("Snapshot listener error:", error);
   });
-  
+
   return unsubscribe;
 };
 
@@ -964,12 +1188,12 @@ startRealtimeListener();
 
 app.get('/api/inventory/stream', (req, res) => {
   console.log("New client connected to /api/inventory/stream");
-  
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
-  
+
   db.collection('inventory')
     .where('isActive', '==', true)
     .get()
@@ -979,21 +1203,45 @@ app.get('/api/inventory/stream', (req, res) => {
       res.write(`data: ${JSON.stringify(items)}\n\n`);
     })
     .catch(err => console.error("Initial data error:", err));
-  
+
   const clientId = Date.now();
   const newClient = { id: clientId, res };
   clients.push(newClient);
-  
+
   req.on('close', () => {
     console.log(`Client ${clientId} disconnected`);
     clients = clients.filter(c => c.id !== clientId);
   });
 });
 
-const PORT = 8080;
+// ========== START SERVER ==========
+
+const PORT = process.env.PORT || 8080;
+
 app.listen(PORT, () => {
-  console.log(`MIGINGO BACKEND — FULLY OPEN (NO RESTRICTIONS)`);
-  console.log(`http://localhost:${PORT}`);
-  console.log(`Import, add, edit, delete — EVERYTHING WORKS FOR ANYONE`);
-  console.log(`Stock issuance with packaging layers — ALL ENDPOINTS ACTIVE`);
+  console.log(`==================================================`);
+  console.log(`🚀 MIGINGO BACKEND SERVER STARTED`);
+  console.log(`==================================================`);
+  console.log(`📍 Server running at: http://localhost:${PORT}`);
+  console.log(`📊 Real-time inventory: http://localhost:${PORT}/api/inventory/stream`);
+  console.log(`✅ Health check: http://localhost:${PORT}/health`);
+  console.log(`==================================================`);
+  console.log(`Available Endpoints:`);
+  console.log(`  - POST   /api/auth/register`);
+  console.log(`  - POST   /api/auth/login`);
+  console.log(`  - GET    /api/users`);
+  console.log(`  - PATCH  /api/users/:id/verify`);
+  console.log(`  - PATCH  /api/users/:id/assign-vehicle`);
+  console.log(`  - GET    /api/suppliers`);
+  console.log(`  - GET    /api/inventory`);
+  console.log(`  - POST   /api/inventory`);
+  console.log(`  - PUT    /api/inventory/:id`);
+  console.log(`  - POST   /api/inventory/:id/break`);
+  console.log(`  - GET    /api/vehicles`);
+  console.log(`  - GET    /api/vehicles/:id`);
+  console.log(`  - POST   /api/vehicles`);
+  console.log(`  - POST   /api/stock-issuance`);
+  console.log(`  - GET    /api/vehicles/:vehicleId/issuances`);
+  console.log(`  - PATCH  /api/stock-issuance/:id/item/:itemIndex/layer/:layerIndex/collect`);
+  console.log(`==================================================`);
 });
