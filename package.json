@@ -1,0 +1,35 @@
+{
+  "name": "migingo-store-backend",
+  "version": "1.0.0",
+  "description": "Migingo Supermarket – Store Team & Inventory Backend (Express + Firebase)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "echo \"No tests yet – add later\" && exit 0"
+  },
+  "keywords": [
+    "migingo",
+    "supermarket",
+    "inventory",
+    "van-sales",
+    "firebase",
+    "express"
+  ],
+  "author": "Migingo Supermarket Team",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "firebase-admin": "^13.6.0",
+    "morgan": "^1.10.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}

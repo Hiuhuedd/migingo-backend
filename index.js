@@ -1,0 +1,462 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const morgan = require('morgan');
+const admin = require('firebase-admin');
+
+const serviceAccount = require('./serviceAccountKey.json');
+const { parseSupplierItem } = require('./utils/universalSupplierParser');
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+const db = admin.firestore();
+const app = express();
+
+app.use(cors({ origin: '*' }));
+app.use(morgan('dev'));
+app.use(express.json());
+
+// Helper function to serialize Firestore timestamps
+const serializeTimestamp = (timestamp) => {
+  if (!timestamp) return null;
+  if (timestamp.toDate) {
+    return timestamp.toDate().toISOString();
+  }
+  return timestamp;
+};
+
+// Helper function to serialize Firestore document
+const serializeDoc = (doc) => {
+  const data = doc.data();
+  const serialized = { id: doc.id };
+  
+  for (const [key, value] of Object.entries(data)) {
+    if (value && typeof value === 'object' && value.toDate) {
+      serialized[key] = serializeTimestamp(value);
+    } else if (Array.isArray(value)) {
+      serialized[key] = value.map(item => {
+        if (item && typeof item === 'object') {
+          const serializedItem = {};
+          for (const [k, v] of Object.entries(item)) {
+            serializedItem[k] = (v && typeof v === 'object' && v.toDate) ? serializeTimestamp(v) : v;
+          }
+          return serializedItem;
+        }
+        return item;
+      });
+    } else {
+      serialized[key] = value;
+    }
+  }
+  
+  return serialized;
+};
+
+// PUBLIC: Supplier list
+app.get('/api/suppliers', (req, res) => {
+  try {
+    const data = require('./data/supplierItems.json');
+    res.json(data.items);
+  } catch (err) {
+    res.status(500).json({ error: 'Suppliers not found' });
+  }
+});
+
+// GET inventory
+app.get('/api/inventory', async (req, res) => {
+  try {
+    let query = db.collection('inventory').where('isActive', '==', true);
+    if (req.query.search) {
+      const term = req.query.search.toLowerCase();
+      query = query.where('productNameLower', '>=', term).where('productNameLower', '<=', term + '\uf8ff');
+    }
+    if (req.query.category && req.query.category !== 'all') {
+      query = query.where('category', '==', req.query.category);
+    }
+    const snapshot = await query.orderBy('productNameLower').get();
+    const items = snapshot.docs.map(doc => serializeDoc(doc));
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ADD inventory item
+app.post('/api/inventory', async (req, res) => {
+  try {
+    const existingSnapshot = await db.collection('inventory')
+      .where('productNameLower', '==', req.body.productName.toLowerCase())
+      .where('isActive', '==', true)
+      .get();
+
+    if (!existingSnapshot.empty) {
+      return res.status(400).json({
+        error: 'Duplicate product name',
+        message: `Item "${req.body.productName}" already exists in inventory`
+      });
+    }
+
+    const data = {
+      ...req.body,
+      productNameLower: (req.body.productName || '').toLowerCase(),
+      isActive: true,
+      hasSubUnits: req.body.hasSubUnits || false,
+      subUnitName: req.body.subUnitName || "",
+      subUnitsPerSupplierUnit: req.body.subUnitsPerSupplierUnit || 0,
+      piecesPerSubUnit: req.body.piecesPerSubUnit || 0,
+      sellingPricePerSubUnit: req.body.sellingPricePerSubUnit || 0,
+      stockInSubUnits: req.body.stockInSubUnits || 0,
+      dateAdded: admin.firestore.FieldValue.serverTimestamp(),
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    const ref = await db.collection('inventory').add(data);
+    res.status(201).json({ id: ref.id, ...data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// UPDATE inventory item
+app.put('/api/inventory/:id', async (req, res) => {
+  try {
+    const data = {
+      ...req.body,
+      productNameLower: (req.body.productName || '').toLowerCase(),
+      hasSubUnits: req.body.hasSubUnits || false,
+      subUnitName: req.body.subUnitName || "",
+      subUnitsPerSupplierUnit: req.body.subUnitsPerSupplierUnit || 0,
+      piecesPerSubUnit: req.body.piecesPerSubUnit || 0,
+      sellingPricePerSubUnit: req.body.sellingPricePerSubUnit || 0,
+      stockInSubUnits: req.body.stockInSubUnits || 0,
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    await db.collection('inventory').doc(req.params.id).update(data);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE inventory item (soft delete)
+app.delete('/api/inventory/:id', async (req, res) => {
+  try {
+    await db.collection('inventory').doc(req.params.id).update({
+      isActive: false,
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// IMPORT from supplier
+app.post('/api/inventory/import', async (req, res) => {
+  const { supplierItem } = req.body;
+  const { name, price, supplier = "Unknown", category = "misc" } = supplierItem;
+
+  try {
+    const cleanName = name.replace(/\d+\s*[xX×]\s*\d+\s*(PCS?|PIECES?|POUCHES?|SACHETS?|GM|GMS|KG|ML|L)?/gi, '').trim();
+    const existingSnapshot = await db.collection('inventory')
+      .where('productNameLower', '==', cleanName.toLowerCase())
+      .where('isActive', '==', true)
+      .get();
+
+    if (!existingSnapshot.empty) {
+      return res.status(400).json({
+        error: 'Duplicate product name',
+        message: `Item "${cleanName}" already exists in inventory`
+      });
+    }
+
+    const parsed = parseSupplierItem(name, price);
+
+    const newItem = {
+      productName: parsed.productName,
+      supplier,
+      category,
+      buyingPricePerUnit: price,
+      supplierUnit: parsed.supplierUnit,
+      supplierUnitQuantity: parsed.totalSellableUnits,
+      sellingPricePerPiece: 0,
+      sellingPricePerSubUnit: 0,
+      stockInSupplierUnits: 0,
+      stockInSubUnits: 0,
+      lowStockAlert: 5,
+      isActive: true,
+      hasSubUnits: parsed.packagingType === "nested",
+      subUnitName: parsed.packagingStructure?.outer?.unit || "",
+      subUnitsPerSupplierUnit: parsed.packagingStructure?.outer?.quantity || 0,
+      piecesPerSubUnit: parsed.packagingStructure?.inner?.quantity || 0,
+      productNameLower: parsed.productName.toLowerCase(),
+      dateAdded: admin.firestore.FieldValue.serverTimestamp(),
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const ref = await db.collection('inventory').add(newItem);
+    res.status(201).json({ id: ref.id, ...newItem });
+  } catch (err) {
+    console.error("Import error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== VEHICLES ==========
+app.get('/api/vehicles', async (req, res) => {
+  try {
+    const snapshot = await db.collection('vehicles').where('isActive', '==', true).get();
+    const vehicles = snapshot.docs.map(doc => serializeDoc(doc));
+    res.json(vehicles);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/vehicles', async (req, res) => {
+  try {
+    const { vehicleName, registrationNumber, salesTeamMember } = req.body;
+    const data = {
+      vehicleName,
+      registrationNumber,
+      salesTeamMember,
+      isActive: true,
+      dateCreated: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    const ref = await db.collection('vehicles').add(data);
+    res.status(201).json({ id: ref.id, ...data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/vehicles/:id', async (req, res) => {
+  try {
+    const doc = await db.collection('vehicles').doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Vehicle not found' });
+    res.json(serializeDoc(doc));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== STOCK ISSUANCE ==========
+app.post('/api/stock-issuance', async (req, res) => {
+  try {
+    const { vehicleId, items } = req.body;
+
+    if (!vehicleId || !items || items.length === 0) {
+      return res.status(400).json({ error: 'vehicleId and items required' });
+    }
+
+    const vehicleDoc = await db.collection('vehicles').doc(vehicleId).get();
+    if (!vehicleDoc.exists) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    const issuanceRef = db.collection('stock-issuances').doc();
+    const issuanceData = {
+      vehicleId,
+      items: [],
+      status: 'issued',
+      issuedAt: admin.firestore.FieldValue.serverTimestamp(),
+      collectedAt: null,
+      notes: req.body.notes || '',
+    };
+
+    // Process each item with packaging structure support
+    for (const itemToIssue of items) {
+      const { inventoryId, layers } = itemToIssue; // layers = [{layerIndex, quantity}]
+      
+      const inventoryDoc = await db.collection('inventory').doc(inventoryId).get();
+      if (!inventoryDoc.exists) {
+        return res.status(404).json({ error: `Inventory item ${inventoryId} not found` });
+      }
+
+      const inventoryData = inventoryDoc.data();
+      const packagingStructure = inventoryData.packagingStructure || [];
+      
+      // Validate stock availability for each layer
+      for (const layer of layers) {
+        const { layerIndex, quantity } = layer;
+        const packagingLayer = packagingStructure[layerIndex];
+        
+        if (!packagingLayer) {
+          return res.status(400).json({
+            error: `Invalid layer index ${layerIndex} for ${inventoryData.productName}`
+          });
+        }
+
+        const currentStock = packagingLayer.stock || 0;
+        if (currentStock < quantity) {
+          return res.status(400).json({
+            error: `Insufficient stock for ${inventoryData.productName} - ${packagingLayer.unit}`,
+            available: currentStock,
+            requested: quantity
+          });
+        }
+      }
+
+      // Update inventory - subtract from each layer
+      const updatedPackaging = [...packagingStructure];
+      for (const layer of layers) {
+        const { layerIndex, quantity } = layer;
+        updatedPackaging[layerIndex] = {
+          ...updatedPackaging[layerIndex],
+          stock: (updatedPackaging[layerIndex].stock || 0) - quantity
+        };
+      }
+
+      await db.collection('inventory').doc(inventoryId).update({
+        packagingStructure: updatedPackaging,
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      // Add to issuance record with layer details
+      issuanceData.items.push({
+        inventoryId,
+        productName: inventoryData.productName,
+        layers: layers.map(l => ({
+          layerIndex: l.layerIndex,
+          unit: packagingStructure[l.layerIndex].unit,
+          quantity: l.quantity,
+          collectedQty: 0,
+          collected: false,
+          collectedAt: null
+        })),
+        buyingPrice: inventoryData.buyingPricePerUnit || 0,
+      });
+    }
+
+    await issuanceRef.set(issuanceData);
+    
+    const createdDoc = await issuanceRef.get();
+    res.status(201).json(serializeDoc(createdDoc));
+  } catch (err) {
+    console.error('Stock issuance error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET issuances for vehicle
+app.get('/api/vehicles/:vehicleId/issuances', async (req, res) => {
+  try {
+    const snapshot = await db.collection('stock-issuances')
+      .where('vehicleId', '==', req.params.vehicleId)
+      .orderBy('issuedAt', 'desc')
+      .get();
+    
+    const issuances = snapshot.docs.map(doc => serializeDoc(doc));
+    res.json(issuances);
+  } catch (err) {
+    console.error('Error fetching issuances:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH mark issuance item layer as collected
+app.patch('/api/stock-issuance/:issuanceId/item/:itemIndex/layer/:layerIndex/collect', async (req, res) => {
+  try {
+    const { issuanceId, itemIndex, layerIndex } = req.params;
+    const issuanceDoc = await db.collection('stock-issuances').doc(issuanceId).get();
+
+    if (!issuanceDoc.exists) {
+      return res.status(404).json({ error: 'Issuance not found' });
+    }
+
+    const issuanceData = issuanceDoc.data();
+    const item = issuanceData.items[parseInt(itemIndex)];
+
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found in issuance' });
+    }
+
+    const layer = item.layers[parseInt(layerIndex)];
+    if (!layer) {
+      return res.status(404).json({ error: 'Layer not found' });
+    }
+
+    // Mark layer as collected
+    layer.collected = true;
+    layer.collectedQty = layer.quantity;
+    layer.collectedAt = admin.firestore.FieldValue.serverTimestamp();
+
+    // Check if all items' all layers are collected
+    const allCollected = issuanceData.items.every(i => 
+      i.layers.every(l => l.collected)
+    );
+
+    await db.collection('stock-issuances').doc(issuanceId).update({
+      items: issuanceData.items,
+      status: allCollected ? 'collected' : 'partial',
+      collectedAt: allCollected ? admin.firestore.FieldValue.serverTimestamp() : null,
+    });
+
+    res.json({ success: true, status: allCollected ? 'collected' : 'partial' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ========== REAL-TIME INVENTORY STREAM ==========
+let clients = [];
+
+const startRealtimeListener = () => {
+  console.log("Starting real-time inventory listener...");
+
+  const query = db.collection('inventory').where('isActive', '==', true);
+
+  const unsubscribe = query.onSnapshot((snapshot) => {
+    const items = snapshot.docs.map(doc => serializeDoc(doc));
+
+    console.log(`Pushing ${items.length} items to ${clients.length} clients`);
+
+    clients.forEach(client => {
+      client.res.write(`data: ${JSON.stringify(items)}\n\n`);
+    });
+  }, (error) => {
+    console.error("Snapshot listener error:", error);
+  });
+
+  return unsubscribe;
+};
+
+startRealtimeListener();
+
+app.get('/api/inventory/stream', (req, res) => {
+  console.log("New client connected to /api/inventory/stream");
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  db.collection('inventory')
+    .where('isActive', '==', true)
+    .get()
+    .then(snapshot => {
+      const items = snapshot.docs.map(doc => serializeDoc(doc));
+      console.log(`Sending initial ${items.length} items to new client`);
+      res.write(`data: ${JSON.stringify(items)}\n\n`);
+    })
+    .catch(err => console.error("Initial data error:", err));
+
+  const clientId = Date.now();
+  const newClient = { id: clientId, res };
+  clients.push(newClient);
+
+  req.on('close', () => {
+    console.log(`Client ${clientId} disconnected`);
+    clients = clients.filter(c => c.id !== clientId);
+  });
+});
+
+const PORT = 8080;
+app.listen(PORT, () => {
+  console.log(`MIGINGO BACKEND — FULLY OPEN (NO RESTRICTIONS)`);
+  console.log(`http://localhost:${PORT}`);
+  console.log(`Import, add, edit, delete — EVERYTHING WORKS FOR ANYONE`);
+  console.log(`Stock issuance with packaging layers — ALL ENDPOINTS ACTIVE`);
+});
