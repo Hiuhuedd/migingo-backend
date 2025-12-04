@@ -96,6 +96,81 @@ module.exports = (db, admin, serializeDoc) => {
             res.status(500).json({ error: err.message });
         }
     });
+ //BREAK UNIT Endpoint
+    router.post('/:id/break', async (req, res) => {
+  try {
+    const { quantity } = req.body; // quantity of master units to break (default 1)
+    const qtyToBreak = parseInt(quantity) || 1;
+
+    if (qtyToBreak <= 0) return res.status(400).json({ error: 'Invalid quantity' });
+
+    await db.runTransaction(async (t) => {
+      const docRef = db.collection('inventory').doc(req.params.id);
+      const doc = await t.get(docRef);
+
+      if (!doc.exists) throw new Error('Item not found');
+
+      const data = doc.data();
+      const packaging = data.packagingStructure;
+
+      // Case 1: Array-based structure
+      if (packaging && Array.isArray(packaging) && packaging.length >= 2) {
+        const masterIdx = 0;
+        const subIdx = 1;
+
+        const masterStock = packaging[masterIdx].stock || 0;
+        if (masterStock < qtyToBreak) {
+          throw new Error('Insufficient master units to break');
+        }
+
+        // Try to get conversion from root field, or fallback to 2nd layer 'qty'
+        let conversion = data.subUnitsPerSupplierUnit;
+        if (!conversion && packaging[subIdx].qty) {
+          conversion = packaging[subIdx].qty;
+        }
+
+        if (!conversion || conversion <= 0) {
+          throw new Error('Invalid conversion rate defined for item');
+        }
+
+        const subUnitsToAdd = qtyToBreak * conversion;
+
+        packaging[masterIdx].stock = masterStock - qtyToBreak;
+        packaging[subIdx].stock = (packaging[subIdx].stock || 0) + subUnitsToAdd;
+
+        t.update(docRef, {
+          packagingStructure: packaging,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+        });
+        return;
+      }
+
+      // Case 2: Flat structure (Legacy)
+      // Check if we have enough info to break
+      if (data.hasSubUnits && data.subUnitsPerSupplierUnit > 0) {
+        const masterStock = data.stockInSupplierUnits || 0;
+        if (masterStock < qtyToBreak) {
+          throw new Error('Insufficient master units to break');
+        }
+
+        const subUnitsToAdd = qtyToBreak * data.subUnitsPerSupplierUnit;
+
+        t.update(docRef, {
+          stockInSupplierUnits: masterStock - qtyToBreak,
+          stockInSubUnits: (data.stockInSubUnits || 0) + subUnitsToAdd,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+        });
+        return;
+      }
+
+      throw new Error('Item does not support breaking units');
+    });
+
+    res.json({ success: true, message: 'Unit broken successfully' });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
 
     // IMPORT from supplier
     router.post('/import', async (req, res) => {
