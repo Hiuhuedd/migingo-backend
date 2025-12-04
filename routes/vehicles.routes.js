@@ -61,5 +61,62 @@ module.exports = (db, admin, serializeDoc) => {
         }
     });
 
+    // Get collected items for a vehicle (for sales) - WITH PRICES
+    router.get('/:id/collected-items', async (req, res) => {
+        try {
+            const snapshot = await db.collection('stock-issuances')
+                .where('vehicleId', '==', req.params.id)
+                .get();
+
+            const collectedItems = [];
+            const itemsMap = new Map();
+            const inventoryCache = new Map();
+
+            // First pass: collect all items and fetch inventory data
+            for (const doc of snapshot.docs) {
+                const issuance = doc.data();
+                for (const item of issuance.items) {
+                    // Fetch inventory data if not cached
+                    if (!inventoryCache.has(item.inventoryId)) {
+                        const inventoryDoc = await db.collection('inventory').doc(item.inventoryId).get();
+                        if (inventoryDoc.exists) {
+                            inventoryCache.set(item.inventoryId, inventoryDoc.data());
+                        }
+                    }
+
+                    const inventoryData = inventoryCache.get(item.inventoryId);
+                    const packagingStructure = inventoryData?.packagingStructure || [];
+
+                    item.layers.forEach(layer => {
+                        if (layer.collected) {
+                            const key = `${item.inventoryId}-${layer.unit}`;
+                            const existing = itemsMap.get(key);
+
+                            if (existing) {
+                                existing.quantity += layer.quantity;
+                            } else {
+                                itemsMap.set(key, {
+                                    inventoryId: item.inventoryId,
+                                    productName: item.productName,
+                                    unit: layer.unit,
+                                    quantity: layer.quantity,
+                                    sellingPrice: layer.sellingPrice || 0,
+                                    layerIndex: layer.layerIndex,
+                                    packagingStructure: packagingStructure,
+                                });
+                            }
+                        }
+                    });
+                }
+            }
+
+            collectedItems.push(...itemsMap.values());
+            res.json(collectedItems);
+        } catch (err) {
+            console.error('Error fetching collected items:', err);
+            res.status(500).json({ error: err.message });
+        }
+    });
+
     return router;
 };
