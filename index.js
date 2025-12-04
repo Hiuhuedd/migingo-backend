@@ -59,6 +59,7 @@ const vehiclesRoutes = require('./routes/vehicles.routes')(db, admin, serializeD
 const suppliersRoutes = require('./routes/suppliers.routes')();
 const issuanceRoutes = require('./routes/issuance.routes')(db, admin, serializeDoc);
 
+
 // ========== MOUNT ROUTERS ==========
 app.use('/api/auth', authRoutes);
 app.use('/api/users', authRoutes); // User management also in auth routes
@@ -67,6 +68,7 @@ app.use('/api/vehicles', vehiclesRoutes);
 app.use('/api/suppliers', suppliersRoutes);
 app.use('/api/stock-issuance', issuanceRoutes);
 app.use('/api/stock-issuances', issuanceRoutes); // Alternative path
+app.use('/api/sales', require('./routes/sales.routes')(db, admin, serializeDoc));
 
 // ========== REAL-TIME INVENTORY STREAM ==========
 let clients = [];
